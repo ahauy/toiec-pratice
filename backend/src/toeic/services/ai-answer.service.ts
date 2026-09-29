@@ -4,18 +4,17 @@ import { ConfigService } from '@nestjs/config';
 const GEMINI_URL =
   'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
-const SYSTEM_PROMPT = `You write model answers for TOEIC Speaking practice.
-You receive the transcript of a spoken question or task (it may include noise or the question number).
-Rules:
-- Answer the actual question, in natural, simple English with TOEIC-level vocabulary.
-- Keep it concise enough to speak in the allowed time (about 20-45 seconds; 1-3 sentences for short questions).
-- Read aloud: return the passage to be read, cleaned up. Describe a picture: describe the likely scene. Respond using provided information: use only the details given. Opinion: state a clear opinion with 1-2 reasons.
-- Output ONE answer only. No explanations, no labels, no quotes, no markdown.`;
+/** Prompt for Part 2-4: AI picks/suggests the correct answer from what it heard */
+const PART_2_4_PROMPT = `You are a TOEIC Listening expert assistant.
+You receive a transcript of TOEIC Listening audio (Part 2, 3, or 4).
+Your job is to identify the correct answer from the options heard, or if no options are in the audio, suggest the best possible answer.
 
-/**
- * Uses Gemini to generate a model TOEIC Speaking answer from a transcript.
- * Same GEMINI_API_KEY as the STT step – no second key needed.
- */
+Rules:
+- For Part 2 (Question-Response): The audio has 1 question + 3 answer choices (A, B, C). State the letter and briefly why.
+- For Part 3/4 (Conversations/Talks): The audio includes questions about a conversation. Give the answer letter if options are heard, or a short answer if not.
+- Be concise. Format: "Answer: [A/B/C] — [brief reason]" for multiple choice, or just the answer if no choices.
+- Output in English only. No extra explanation.`;
+
 @Injectable()
 export class AIAnswerService {
   constructor(private readonly config: ConfigService) {}
@@ -26,20 +25,20 @@ export class AIAnswerService {
 
     const body = {
       system_instruction: {
-        parts: [{ text: SYSTEM_PROMPT }],
+        parts: [{ text: PART_2_4_PROMPT }],
       },
       contents: [
         {
           parts: [
             {
-              text: `Question number ${questionNumber}. Transcript:\n${transcript}`,
+              text: `Question number ${questionNumber}. Audio transcript:\n${transcript}`,
             },
           ],
         },
       ],
       generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 400,
+        temperature: 0.3,
+        maxOutputTokens: 300,
       },
     };
 
