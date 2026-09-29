@@ -39,13 +39,14 @@ export class ToeicService {
 
     const part = detectPart(questionNumber);
 
-    // Part 1: cannot see the photo → return transcript only, skip AI
+    // Part 1: translate A/B/C/D to Vietnamese so user can decide by photo
     if (part === 1) {
+      const translation = await this.ai.translatePart1(transcript);
       return {
         questionNumber,
         part,
-        answer: transcript,   // "answer" holds transcript for Part 1
-        transcript,
+        answer: translation,  // Vietnamese translation of A/B/C/D
+        transcript,           // original English transcript
       };
     }
 

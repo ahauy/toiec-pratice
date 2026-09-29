@@ -35,22 +35,34 @@ export default function AnswerDisplay({ result }: { result: ToeicResult | null }
               </svg>
             </span>
             <p className="text-xs font-semibold text-amber-700">
-              Part 1 — AI không thể nhìn ảnh. Hãy tự chọn đáp án dựa trên ảnh trong đề thi.
+              Part 1 — Nhìn vào ảnh trong đề thi và tự chọn đáp án phù hợp.
             </p>
           </div>
 
-          {/* Transcript */}
+          {/* Vietnamese translation (main) */}
           <div className="rounded-xl bg-white border border-amber-100 p-4">
-            <p className="mb-1.5 text-[10px] font-bold uppercase tracking-widest text-amber-500">
-              Nội dung audio (transcript)
+            <p className="mb-2 text-[10px] font-bold uppercase tracking-widest text-amber-500">
+              🇻🇳 Bản dịch tiếng Việt
             </p>
-            <p className="text-sm leading-relaxed text-slate-700 whitespace-pre-wrap">
-              {result.transcript ?? result.answer}
+            <p className="text-sm leading-relaxed text-slate-800 whitespace-pre-wrap font-medium">
+              {result.answer}
             </p>
           </div>
+
+          {/* Original transcript (collapsible-style, smaller) */}
+          {result.transcript && (
+            <div className="rounded-xl bg-amber-100/60 p-3">
+              <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-amber-600">
+                🇬🇧 Nguyên bản (English)
+              </p>
+              <p className="text-xs leading-relaxed text-amber-900 whitespace-pre-wrap">
+                {result.transcript}
+              </p>
+            </div>
+          )}
 
           <p className="text-[11px] text-amber-600 italic">
-            💡 Đọc transcript, nhìn ảnh và tự chọn câu mô tả đúng nhất.
+            💡 Đọc bản dịch, nhìn ảnh và chọn câu mô tả đúng nhất.
           </p>
         </div>
       ) : (
