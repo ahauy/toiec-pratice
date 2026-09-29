@@ -2,7 +2,7 @@ import { BadGatewayException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 const GEMINI_URL =
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent';
 
 /** Part 1: Dịch 4 câu A/B/C/D sang tiếng Việt để người dùng tự chọn theo ảnh */
 const PART1_TRANSLATE_PROMPT = `You are a TOEIC Listening assistant for Vietnamese learners.
@@ -22,16 +22,15 @@ Rules:
 - Do NOT choose or hint at the correct answer. User will decide by looking at the photo.
 - Output only the formatted list above. No extra explanation.`;
 
-/** Part 2-4: AI chọn/gợi ý đáp án đúng */
+/** Part 2-4: AI chỉ trả về chữ cái đáp án A/B/C */
 const PART_2_4_PROMPT = `You are a TOEIC Listening expert assistant.
 You receive a transcript of TOEIC Listening audio (Part 2, 3, or 4).
 Your job is to identify the correct answer from the options heard.
 
 Rules:
-- For Part 2 (Question-Response): The audio has 1 question + 3 answer choices (A, B, C). State the letter and briefly why.
-- For Part 3/4 (Conversations/Talks): Give the answer letter if options are heard, or a short answer if not.
-- Be concise. Format: "Answer: [A/B/C] — [brief reason]" for multiple choice.
-- Output in English only. No extra explanation.`;
+- For Part 2 (Question-Response): The audio has 1 question + 3 answer choices (A, B, C). Return ONLY the letter: A, B, or C.
+- For Part 3/4 (Conversations/Talks): Return ONLY the letter: A, B, or C.
+- Output MUST be a single letter only: A, B, or C. No explanation, no extra text.`;
 
 @Injectable()
 export class AIAnswerService {
@@ -57,6 +56,7 @@ export class AIAnswerService {
     userText: string,
     temperature: number,
     maxTokens: number,
+    retries = 3,
   ): Promise<string> {
     const apiKey = this.config.get<string>('GEMINI_API_KEY');
     if (!apiKey) throw new BadGatewayException('GEMINI_API_KEY is not set');
@@ -67,27 +67,38 @@ export class AIAnswerService {
       generationConfig: { temperature, maxOutputTokens: maxTokens },
     };
 
-    const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const res = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new BadGatewayException(`Gemini request failed: ${err}`);
+      // Retry on 503 (overloaded) or 429 (rate limit)
+      if ((res.status === 503 || res.status === 429) && attempt < retries) {
+        const delay = Math.pow(2, attempt) * 1000; // 1s, 2s, 4s
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new BadGatewayException(`Gemini request failed: ${err}`);
+      }
+
+      const data = (await res.json()) as {
+        candidates?: { content?: { parts?: { text?: string }[] } }[];
+      };
+
+      const text = data.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text ?? '')
+        .join('')
+        .trim();
+
+      if (!text) throw new BadGatewayException('Empty Gemini response');
+      return text;
     }
 
-    const data = (await res.json()) as {
-      candidates?: { content?: { parts?: { text?: string }[] } }[];
-    };
-
-    const text = data.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text ?? '')
-      .join('')
-      .trim();
-
-    if (!text) throw new BadGatewayException('Empty Gemini response');
-    return text;
+    throw new BadGatewayException('Gemini service unavailable after retries');
   }
 }
