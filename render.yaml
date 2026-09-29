@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: toeic-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install && npm run build
+    startCommand: node dist/main
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # bạn tự điền trên Render dashboard
+      - key: PORT
+        value: 10000       # Render dùng port 10000 mặc định
+    healthCheckPath: /api/toeic/listen
