@@ -9,7 +9,8 @@
     "esModuleInterop": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "types": ["node", "express", "multer"]
   },
   "include": ["src"]
 }
