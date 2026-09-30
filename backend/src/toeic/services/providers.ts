@@ -39,9 +39,9 @@ export function parseChain(raw: string): ModelSpec[] {
   return out;
 }
 
-export const DEFAULT_STT_CHAIN = 'gemini:gemini-2.0-flash-lite';
+export const DEFAULT_STT_CHAIN = 'gemini:gemini-3.5-flash-lite';
 export const DEFAULT_LLM_CHAIN =
-  'gemini:gemini-2.0-flash-lite,groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b';
+  'gemini:gemini-3.5-flash-lite,groq:openai/gpt-oss-120b,groq:openai/gpt-oss-20b';
 
 /** Tracks models that answered 429 / are broken, so the chain skips them for a while. */
 export class Cooldowns {
