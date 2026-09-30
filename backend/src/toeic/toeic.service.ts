@@ -1,66 +1,200 @@
-import { Injectable, UnprocessableEntityException } from '@nestjs/common';
-import { SpeechToTextService } from './services/speech-to-text.service';
-import { AIAnswerService } from './services/ai-answer.service';
-import { ToeicResponseDto, ToeicPart } from './dto/toeic-response.dto';
+import { Injectable } from '@nestjs/common';
+import { SttService } from './services/stt.service';
+import { LlmService } from './services/llm.service';
+import { Job, Part, SetState, Tracker } from './tracker';
+import { Part1Result, Part2Result, SetQuestion, ToeicEvent } from './dto/events';
+import { PART1_SYSTEM, PART2_SYSTEM, SET_SYSTEM, part1User, part2User, setUser } from './prompts';
 
-const WORDS: Record<string, number> = {
-  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
-  ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15,
-  sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
-};
+export type Emit = (event: ToeicEvent) => void;
 
-/** Map question number → TOEIC Listening part */
-function detectPart(q: number): ToeicPart {
-  if (q <= 6) return 1;
-  if (q <= 31) return 2;
-  if (q <= 70) return 3;
-  return 4;
+/** One practice run. Chunks may arrive out of order, so `seq` gates the (cheap, synchronous) tracking step. */
+class Session {
+  readonly tracker = new Tracker();
+  lastSeen = Date.now();
+  autoSeq = 0;
+  /** LLM calls of Part 3/4 sets are serialised so each one sees which questions are already answered */
+  setQueue: Promise<void> = Promise.resolve();
+  private processed = 0;
+  private waiters: { seq: number; resolve: () => void }[] = [];
+
+  async waitTurn(seq: number, timeoutMs = 8000) {
+    if (seq <= this.processed + 1) return;
+    await new Promise<void>((resolve) => {
+      const w = { seq, resolve };
+      this.waiters.push(w);
+      setTimeout(() => {
+        this.waiters = this.waiters.filter((x) => x !== w);
+        resolve();
+      }, timeoutMs).unref?.();
+    });
+  }
+
+  release(seq: number) {
+    this.processed = Math.max(this.processed, seq);
+    const ready = this.waiters.filter((w) => w.seq <= this.processed + 1);
+    this.waiters = this.waiters.filter((w) => !ready.includes(w));
+    ready.forEach((w) => w.resolve());
+  }
 }
+
+const asConfidence = (v: unknown): 'high' | 'medium' | 'low' =>
+  v === 'high' || v === 'medium' || v === 'low' ? v : 'medium';
 
 @Injectable()
 export class ToeicService {
-  // sessionId -> last detected question number (in-memory, fine for personal use)
-  private readonly sessions = new Map<string, number>();
+  private readonly sessions = new Map<string, Session>();
 
   constructor(
-    private readonly stt: SpeechToTextService,
-    private readonly ai: AIAnswerService,
-  ) {}
-
-  async listen(file: Express.Multer.File, sessionId: string): Promise<ToeicResponseDto> {
-    const transcript = (await this.stt.transcribe(file)).trim();
-    if (transcript.length < 3) {
-      throw new UnprocessableEntityException('Could not understand the audio');
-    }
-
-    const last = this.sessions.get(sessionId) ?? 0;
-    const questionNumber = this.detectQuestionNumber(transcript) ?? last + 1;
-    this.sessions.set(sessionId, questionNumber);
-
-    const part = detectPart(questionNumber);
-
-    // Part 1: translate A/B/C/D to Vietnamese so user can decide by photo
-    if (part === 1) {
-      const translation = await this.ai.translatePart1(transcript);
-      return {
-        questionNumber,
-        part,
-        answer: translation,  // Vietnamese translation of A/B/C/D
-        transcript,           // original English transcript
-      };
-    }
-
-    // Part 2–4: AI selects / suggests the correct answer
-    const answer = await this.ai.generate(transcript, questionNumber);
-    return { questionNumber, part, answer };
+    private readonly stt: SttService,
+    private readonly llm: LlmService,
+  ) {
+    setInterval(() => {
+      const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+      for (const [id, s] of this.sessions) if (s.lastSeen < cutoff) this.sessions.delete(id);
+    }, 10 * 60 * 1000).unref();
   }
 
-  private detectQuestionNumber(text: string): number | null {
-    const m = text.match(
-      /question(?:\s+number)?\s+(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b/i,
+  private session(id: string): Session {
+    let s = this.sessions.get(id);
+    if (!s) {
+      s = new Session();
+      this.sessions.set(id, s);
+    }
+    s.lastSeen = Date.now();
+    return s;
+  }
+
+  setPosition(sessionId: string, part?: Part, question?: number) {
+    const s = this.session(sessionId);
+    s.tracker.reposition(part, question);
+    return s.tracker.position();
+  }
+
+  /** Handles one audio chunk end to end and streams events through `emit`. */
+  async handleChunk(sessionId: string, seqIn: number | undefined, wav: Buffer, emit: Emit): Promise<void> {
+    const s = this.session(sessionId);
+    const seq = seqIn && seqIn > 0 ? seqIn : ++s.autoSeq;
+
+    // STT starts immediately, in parallel with earlier chunks; ordering is enforced afterwards.
+    const currentPart = s.tracker.position().part;
+    const sttPromise = this.stt.transcribe(wav, currentPart).then(
+      (v) => ({ ok: true as const, v }),
+      (e: Error) => ({ ok: false as const, e }),
     );
-    if (!m) return null;
-    const raw = m[1].toLowerCase();
-    return /^\d+$/.test(raw) ? parseInt(raw, 10) : WORDS[raw];
+
+    let jobs: Job[] = [];
+    try {
+      const r = await sttPromise;
+      await s.waitTurn(seq);
+      if (!r.ok) {
+        emit({ type: 'error', seq, stage: 'stt', message: r.e.message });
+      } else if (r.v.text) {
+        emit({ type: 'transcript', seq, text: r.v.text, sttMs: r.v.ms, provider: r.v.provider });
+        jobs = s.tracker.ingest(r.v.text).jobs;
+        const pos = s.tracker.position();
+        emit({ type: 'position', part: pos.part, next: pos.next });
+      }
+    } finally {
+      s.release(seq);
+    }
+
+    await Promise.all(jobs.map((j) => this.runJob(s, j, seq, emit)));
+    emit({ type: 'done', seq });
+  }
+
+  private async runJob(s: Session, job: Job, seq: number, emit: Emit): Promise<void> {
+    try {
+      if (job.kind === 'item') {
+        if (job.part === 1) {
+          const r = await this.llm.json<Part1Result>(PART1_SYSTEM, part1User(job.text), { maxTokens: 700 });
+          const statements = Array.isArray(r.data.statements) ? r.data.statements : [];
+          // validate: cần ít nhất 1 statement có label
+          if (!statements.some((s) => s.label)) return;
+          emit({ type: 'item', seq, part: 1, number: job.number, data: { statements }, ms: r.ms, model: r.model });
+        } else {
+          const r = await this.llm.json<Part2Result>(PART2_SYSTEM, part2User(job.text), { maxTokens: 600 });
+          const letter = String(r.data.answer ?? '').trim().charAt(0).toUpperCase();
+          const answer = (['A', 'B', 'C'].includes(letter) ? letter : 'A') as 'A' | 'B' | 'C';
+          // validate: cần có question_en và options
+          if (!r.data.question_en && !Array.isArray(r.data.options)) return;
+          const data: Part2Result = {
+            question_en: r.data.question_en ?? '',
+            question_vi: r.data.question_vi ?? '',
+            options: Array.isArray(r.data.options) ? r.data.options : [],
+            answer,
+            reason_vi: r.data.reason_vi ?? '',
+            confidence: ['A', 'B', 'C'].includes(letter) ? asConfidence(r.data.confidence) : 'low',
+          };
+          emit({ type: 'item', seq, part: 2, number: job.number, data, ms: r.ms, model: r.model });
+        }
+        return;
+      }
+
+      // Part 3/4: serialise per session
+      const run = s.setQueue.then(() => this.runSet(s, job.set, seq, emit));
+      s.setQueue = run.catch(() => undefined);
+      await run;
+    } catch (e) {
+      emit({ type: 'error', seq, stage: 'llm', message: (e as Error).message });
+    }
+  }
+
+  private async runSet(s: Session, set: SetState, seq: number, emit: Emit): Promise<void> {
+    const size = set.last - set.first + 1;
+    if (set.answered >= size) return; // a previous call already answered everything
+    const needGist = !set.gistDone;
+    const answeredBefore = set.answered;
+    const remainingQ = size - answeredBefore;
+
+    // Adaptive maxTokens: ít hơn khi chỉ cần gist, nhiều hơn khi có nhiều câu hỏi cần trả lời
+    const maxTokens = needGist && remainingQ === 0 ? 400 : 400 + remainingQ * 180;
+
+    const r = await this.llm.json<{ gist_vi?: string; questions?: Partial<SetQuestion>[] }>(
+      SET_SYSTEM,
+      setUser({
+        kind: set.kind,
+        first: set.first,
+        last: set.last,
+        answered: answeredBefore,
+        needGist,
+        chunks: [...set.chunks],
+      }),
+      { maxTokens, timeoutMs: 15_000 },
+    );
+
+    const gist = needGist && typeof r.data.gist_vi === 'string' && r.data.gist_vi.trim() ? r.data.gist_vi.trim() : undefined;
+    if (gist) set.gistDone = true;
+
+    const raw = Array.isArray(r.data.questions) ? r.data.questions.slice(0, remainingQ) : [];
+    const questions: SetQuestion[] = raw
+      .filter((q) => q.answer_en) // validate: bỏ question trống
+      .map((q, i) => ({
+        number: set.first + answeredBefore + i,
+        text_en: q.text_en ?? '',
+        text_vi: q.text_vi,
+        answer_en: q.answer_en ?? '',
+        answer_vi: q.answer_vi ?? '',
+        reason_vi: q.reason_vi,
+        confidence: asConfidence(q.confidence),
+        needs_visual: !!q.needs_visual,
+      }));
+
+    if (questions.length) s.tracker.markAnswered(set, questions.length);
+    if (!gist && !questions.length) return;
+    emit({
+      type: 'set',
+      seq,
+      setId: set.id,
+      part: set.part,
+      first: set.first,
+      last: set.last,
+      kind: set.kind,
+      gist_vi: gist,
+      questions,
+      ms: r.ms,
+      model: r.model,
+    });
+    const pos = s.tracker.position();
+    emit({ type: 'position', part: pos.part, next: pos.next });
   }
 }

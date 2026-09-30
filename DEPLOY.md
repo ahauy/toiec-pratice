@@ -1,104 +1,69 @@
-# 🚀 Hướng dẫn Deploy TOEIC Practice App
+# TOEIC Listening AI — cách chạy và deploy
 
-## Kiến trúc deploy
+App nghe liên tục đề Listening (Part 1 → 4) qua micro, tự chia từng câu, rồi:
+
+| Part | AI làm gì |
+|------|-----------|
+| 1 | Dịch 4 câu A-D sang tiếng Việt kèm gợi ý cần nhìn gì trong ảnh (AI không thấy ảnh nên không đoán đáp án) |
+| 2 | Chọn A/B/C và nêu lý do ngắn |
+| 3, 4 | Tóm tắt hội thoại/bài nói, rồi trả **nội dung đáp án** cho từng câu hỏi khi nó được đọc (đáp án A-D chỉ in trong đề, không có trong audio) |
+
+## Kiến trúc
 
 ```
-[Mobile/Browser]
-      ↓ HTTPS
-[Vercel] — React Frontend
-      ↓ fetch HTTPS
-[Railway] — NestJS Backend
-      ↓
-[Gemini API]
+[Micro] -> trình duyệt: VAD cắt câu theo khoảng im lặng, đóng gói WAV 16 kHz
+        -> POST /api/toeic/chunk  (multipart)  <- phản hồi là luồng NDJSON
+[NestJS] -> STT: Groq Whisper (fallback Gemini) -> máy trạng thái theo cấu trúc đề
+         -> LLM: Groq gpt-oss -> Gemini Flash-Lite (tự chuyển khi bị 429/lỗi)
 ```
 
-> ⚠️ **HTTPS là bắt buộc** để microphone hoạt động trên mobile. Railway + Vercel đều cấp HTTPS miễn phí.
+Toàn bộ dùng gói **miễn phí**. Cần ít nhất một trong hai key (có cả hai thì tự dự phòng cho nhau):
 
----
+- Groq: https://console.groq.com/keys
+- Google AI Studio: https://aistudio.google.com/app/apikey
 
-## PHẦN 1 — Deploy Backend lên Railway
+> Hạn mức free thay đổi thường xuyên, hãy xem trang Limits trong console của từng nhà cung cấp.
+> Mỗi lần nghe hết 100 câu tốn khoảng 120-130 request STT và khoảng 120 request LLM.
 
-### Bước 1: Push code lên GitHub
+## Chạy local
 
 ```bash
-# Tại thư mục gốc toeic-practice/
-git init
-git add .
-git commit -m "feat: initial toeic practice app"
+cd backend && cp .env.example .env   # điền GROQ_API_KEY và/hoặc GEMINI_API_KEY
+npm install && npm run start:dev     # :3000
 
-# Tạo repo mới trên github.com rồi:
-git remote add origin https://github.com/YOUR_USERNAME/toeic-practice.git
-git push -u origin main
+cd frontend && npm install && npm run dev   # :5173 (proxy /api -> :3000)
 ```
 
-### Bước 2: Deploy Backend
+Micro chỉ hoạt động trên `localhost` hoặc HTTPS.
 
-1. Vào **[railway.app](https://railway.app)** → Sign in với GitHub
-2. Click **"New Project"** → **"Deploy from GitHub repo"**
-3. Chọn repo `toeic-practice`
-4. Set **Root Directory** = `backend`
-5. Sau khi deploy, vào tab **"Variables"** và thêm:
+## Deploy
 
-| Key | Value |
-|-----|-------|
-| `GEMINI_API_KEY` | API key của bạn |
-| `PORT` | `3000` |
+1. **Backend (Railway hoặc Render)**: Root Directory = `backend`. Biến môi trường: `GROQ_API_KEY`, `GEMINI_API_KEY`, `PORT`. Kiểm tra: mở `https://<backend>/api/health`, kết quả `{"ok":true,"groq":true,...}`.
+   Render free tier tự ngủ sau một thời gian không dùng, request đầu có thể chậm 30 giây trở lên, nên hãy mở app trước khi vào bài.
+2. **Frontend (Vercel)**: Root Directory = `frontend`, biến `VITE_API_URL` = URL backend.
+3. **Chống người lạ dùng hết quota (tùy chọn)**: đặt `APP_TOKEN` ở backend và `VITE_APP_TOKEN` cùng giá trị ở frontend. Đây chỉ là rào cản đơn giản vì token nằm trong bundle frontend. Đặt thêm `ALLOWED_ORIGINS=https://<frontend>` để giới hạn CORS.
 
-6. Vào **"Settings"** → **"Networking"** → **"Generate Domain"**
-   → Có URL dạng: `https://toeic-backend-xxxx.railway.app`
+## Cách dùng khi luyện
 
-7. **Test**: Vào `https://toeic-backend-xxxx.railway.app/api/toeic/listen`
-   → Ra lỗi 400 "Missing audio file" = backend OK ✅
+1. Đặt thiết bị phát đề gần micro, âm lượng vừa phải, tránh méo tiếng.
+2. Chọn Part bắt đầu rồi bấm **Bắt đầu nghe**. Điện thoại được giữ sáng màn hình trong lúc nghe.
+3. Nếu số câu bị lệch (ví dụ lỡ một đoạn), dùng nút Part hoặc ô "Sửa số câu tiếp theo".
+4. Thanh trượt "Im lặng bao lâu thì chốt một câu" cân bằng giữa tốc độ và độ chính xác: ngắn thì đáp án đến sớm nhưng dễ cắt đôi một câu. Giá trị mặc định là 2.2 giây, hãy tinh chỉnh sau vài lần thử với file audio thật của bạn.
 
----
+## Tinh chỉnh model
 
-## PHẦN 2 — Deploy Frontend lên Vercel
+Trong `backend/.env`:
 
-1. Vào **[vercel.com](https://vercel.com)** → Sign in với GitHub
-2. Click **"Add New Project"** → Import repo `toeic-practice`
-3. Cấu hình:
-   - **Root Directory**: `frontend`
-   - **Framework Preset**: Vite (tự detect)
-4. Thêm **Environment Variable**:
+```
+STT_CHAIN=groq:whisper-large-v3-turbo,gemini:gemini-3.1-flash-lite
+LLM_CHAIN=groq:openai/gpt-oss-120b,gemini:gemini-3.1-flash-lite,groq:openai/gpt-oss-20b
+```
 
-| Key | Value |
-|-----|-------|
-| `VITE_API_URL` | `https://toeic-backend-xxxx.railway.app` |
+Mỗi phần tử là `nhà-cung-cấp:model`, thử theo thứ tự. Model nào trả 429 sẽ bị bỏ qua một lúc rồi tự thử lại.
 
-5. Click **"Deploy"**
-   → Có URL dạng: `https://toeic-practice-xxxx.vercel.app`
-
----
-
-## PHẦN 3 — Dùng trên điện thoại
-
-1. Mở Chrome/Safari trên điện thoại
-2. Vào `https://toeic-practice-xxxx.vercel.app`
-3. Cho phép quyền **microphone** khi được hỏi
-4. Nhấn nút mic → Bắt đầu luyện TOEIC!
-
-**Thêm vào màn hình chính như app native:**
-- **iOS Safari**: Share → "Add to Home Screen"
-- **Android Chrome**: Menu ⋮ → "Add to Home Screen"
-
----
-
-## Tóm tắt chi phí
-
-| Service | Chi phí |
-|---------|---------|
-| Railway Hobby | Miễn phí ($5 credit/tháng) |
-| Vercel Free | Miễn phí |
-| Gemini API Free | Miễn phí (15 req/phút) |
-
----
-
-## Local Development
+## Test
 
 ```bash
-# Terminal 1 — Backend
-cd backend && npm run start:dev   # :3000
-
-# Terminal 2 — Frontend
-cd frontend && npm run dev         # :5173 (proxy → :3000)
+cd backend && npm test    # máy trạng thái + end-to-end với server Groq/Gemini giả lập
+cd frontend && npm test   # VAD cắt câu + client đọc luồng NDJSON
 ```
