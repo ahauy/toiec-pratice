@@ -12,10 +12,12 @@ class Session {
   readonly tracker = new Tracker();
   lastSeen = Date.now();
   autoSeq = 0;
+  inFlight = 0;
   /** LLM calls of Part 3/4 sets are serialised so each one sees which questions are already answered */
   setQueue: Promise<void> = Promise.resolve();
   private processed = 0;
   private waiters: { seq: number; resolve: () => void }[] = [];
+  private fallbackCancel: (() => void) | null = null;
 
   async waitTurn(seq: number, timeoutMs = 8000) {
     if (seq <= this.processed + 1) return;
@@ -34,6 +36,34 @@ class Session {
     const ready = this.waiters.filter((w) => w.seq <= this.processed + 1);
     this.waiters = this.waiters.filter((w) => !ready.includes(w));
     ready.forEach((w) => w.resolve());
+  }
+
+  cancelFallback() {
+    if (this.fallbackCancel) {
+      const fn = this.fallbackCancel;
+      this.fallbackCancel = null;
+      fn();
+    }
+  }
+
+  /**
+   * Waits `ms` before force-flushing a partial item/set. Resolves `false` immediately
+   * if a newer chunk arrives (or position is reset) while waiting.
+   */
+  waitForFallback(ms: number): Promise<boolean> {
+    this.cancelFallback();
+    if (this.inFlight > 0) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.fallbackCancel = null;
+        resolve(this.inFlight === 0);
+      }, ms);
+      timer.unref?.();
+      this.fallbackCancel = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+    });
   }
 }
 
@@ -66,6 +96,7 @@ export class ToeicService {
 
   setPosition(sessionId: string, part?: Part, question?: number) {
     const s = this.session(sessionId);
+    s.cancelFallback();
     s.tracker.reposition(part, question);
     return s.tracker.position();
   }
@@ -74,6 +105,8 @@ export class ToeicService {
   async handleChunk(sessionId: string, seqIn: number | undefined, wav: Buffer, emit: Emit): Promise<void> {
     const s = this.session(sessionId);
     const seq = seqIn && seqIn > 0 ? seqIn : ++s.autoSeq;
+    s.inFlight++;
+    s.cancelFallback();
 
     // STT starts immediately, in parallel with earlier chunks; ordering is enforced afterwards.
     const currentPart = s.tracker.position().part;
@@ -95,7 +128,24 @@ export class ToeicService {
         emit({ type: 'position', part: pos.part, next: pos.next });
       }
     } finally {
+      s.inFlight = Math.max(0, s.inFlight - 1);
       s.release(seq);
+    }
+
+    if (jobs.length === 0 && s.inFlight === 0) {
+      const itemMs = Number(process.env.ITEM_FALLBACK_MS) || 2500;
+      const setMs = Number(process.env.SET_FALLBACK_MS) || 4000;
+      const waitMs = s.tracker.pendingTimeoutMs(itemMs, setMs);
+      if (waitMs !== null) {
+        const shouldFlush = await s.waitForFallback(waitMs);
+        if (shouldFlush && s.inFlight === 0) {
+          jobs = s.tracker.flushPending().jobs;
+          if (jobs.length > 0) {
+            const pos = s.tracker.position();
+            emit({ type: 'position', part: pos.part, next: pos.next });
+          }
+        }
+      }
     }
 
     await Promise.all(jobs.map((j) => this.runJob(s, j, seq, emit)));
@@ -146,8 +196,8 @@ export class ToeicService {
     const answeredBefore = set.answered;
     const remainingQ = size - answeredBefore;
 
-    // Adaptive maxTokens: ít hơn khi chỉ cần gist, nhiều hơn khi có nhiều câu hỏi cần trả lời
-    const maxTokens = needGist && remainingQ === 0 ? 400 : 400 + remainingQ * 180;
+    // Adaptive maxTokens: đủ cho cả tóm tắt đoạn + 3 câu hỏi
+    const maxTokens = needGist && remainingQ === 0 ? 400 : 400 + remainingQ * 220;
 
     const r = await this.llm.json<{ gist_vi?: string; questions?: Partial<SetQuestion>[] }>(
       SET_SYSTEM,
@@ -159,7 +209,7 @@ export class ToeicService {
         needGist,
         chunks: [...set.chunks],
       }),
-      { maxTokens, timeoutMs: 15_000 },
+      { maxTokens, timeoutMs: 18_000 },
     );
 
     const gist = needGist && typeof r.data.gist_vi === 'string' && r.data.gist_vi.trim() ? r.data.gist_vi.trim() : undefined;

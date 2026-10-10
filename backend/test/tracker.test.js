@@ -18,6 +18,19 @@ test('part 1: cue then cue-less chunks advance the counter', () => {
   assert.equal(b[0].number, 2);
 });
 
+test('part 1: multi-chunk item buffers until option D arrives', () => {
+  const t = new Tracker();
+  const r1 = t.ingest('Number 1. Look at the picture marked number 1 in your test book. A. The man is pulling a cart. B. The woman is reading.');
+  assert.equal(r1.jobs.length, 0);
+  assert.deepEqual(t.position(), { part: 1, next: 1 });
+
+  const r2 = t.ingest('C. They are seated. D. A bike is parked.');
+  assert.equal(r2.jobs.length, 1);
+  assert.equal(r2.jobs[0].number, 1);
+  assert.match(r2.jobs[0].text, /A\. The man.*D\. A bike/s);
+  assert.deepEqual(t.position(), { part: 1, next: 2 });
+});
+
 test('part 2: two items merged in one chunk are split by "Number N" cues', () => {
   const t = new Tracker();
   t.reposition(2);
@@ -30,6 +43,21 @@ test('part 2: two items merged in one chunk are split by "Number N" cues', () =>
   assert.deepEqual(r.map((j) => j.number), [7, 8]);
   assert.ok(!/answer sheet/i.test(r[0].text));
   assert.equal(t.nextQ, 9);
+});
+
+test('part 2: incomplete item flushes via flushPending() fallback or when next Number cue arrives', () => {
+  const t = new Tracker();
+  t.reposition(2, 7);
+  // Missing option C -> buffered, not emitted yet
+  const r1 = t.ingest('Number 7. Where is the meeting? A. In room 3. B. At noon.');
+  assert.equal(r1.jobs.length, 0);
+  assert.equal(t.pendingTimeoutMs(), 2500);
+
+  // Fallback timer fires -> flushes Question 7 and advances to 8
+  const flushed = t.flushPending();
+  assert.equal(flushed.jobs.length, 1);
+  assert.equal(flushed.jobs[0].number, 7);
+  assert.equal(t.nextQ, 8);
 });
 
 test('a lone "Number 9." waits for the content of the next chunk', () => {
@@ -52,36 +80,48 @@ test('directions of part 3 move the position and produce no job', () => {
   assert.equal(t.nextQ, 32);
 });
 
-test('part 3 set: intro+body, questions, closing and next set without intro', () => {
+test('part 3 set: buffers conversation and questions until all 3 questions are heard, then emits once', () => {
   const t = new Tracker();
   t.reposition(3);
   const r1 = t.ingest('Questions 32 through 34 refer to the following conversation. Hi, this is Anna from the print shop. Your order is ready.');
-  assert.equal(r1.jobs.length, 1);
-  const set = r1.jobs[0].set;
+  assert.equal(r1.jobs.length, 0);
+  assert.deepEqual(t.position(), { part: 3, next: 32 });
+
+  const r2 = t.ingest('Why is the woman calling?');
+  assert.equal(r2.jobs.length, 0);
+  assert.deepEqual(t.position(), { part: 3, next: 33 });
+
+  const r3 = t.ingest('What does the man ask about?');
+  assert.equal(r3.jobs.length, 0);
+  assert.deepEqual(t.position(), { part: 3, next: 34 });
+
+  const r4 = t.ingest('What will the woman do next?');
+  assert.equal(r4.jobs.length, 1);
+  const set = r4.jobs[0].set;
   assert.equal(set.first, 32);
   assert.equal(set.last, 34);
   assert.equal(set.kind, 'conversation');
-  assert.ok(!/Questions 32/.test(set.chunks[0]));
-  t.ingest('Why is the woman calling?');
-  assert.equal(set.chunks.length, 2);
-  assert.deepEqual(t.position(), { part: 3, next: 32 });
-  t.markAnswered(set, 1);
-  assert.deepEqual(t.position(), { part: 3, next: 33 });
-  t.markAnswered(set, 2);
+  assert.equal(set.chunks.length, 4);
   assert.equal(t.set, null);
   assert.equal(t.nextQ, 35);
-  const r2 = t.ingest('Good morning, can I help you find something? I am looking for a gift.');
-  assert.equal(r2.jobs[0].set.first, 35);
+
+  // Next set without explicit intro opens at 35
+  const r5 = t.ingest('Good morning, can I help you find something? I am looking for a gift.');
+  assert.equal(r5.jobs.length, 0);
+  assert.equal(t.set.first, 35);
 });
 
-test('a new intro replaces an unfinished set; part 4 talks are recognised', () => {
+test('a new intro flushes an unfinished set that had questions; part 4 talks are recognised', () => {
   const t = new Tracker();
   t.reposition(3, 68);
   t.ingest('Questions 68 through 70 refer to the following conversation. Hello there my friend how are you.');
+  t.ingest('Number 68. What are the speakers discussing?');
   const r = t.ingest('Questions 71 through 73 refer to the following telephone message. Hi, this is Dr. Lee calling about your appointment.');
-  const set = r.jobs[0].set;
-  assert.equal(set.part, 4);
-  assert.equal(set.kind, 'talk');
+  // Flushed set 68-70 when 71-73 started
+  assert.equal(r.jobs.length, 1);
+  assert.equal(r.jobs[0].set.first, 68);
+  assert.equal(t.set.part, 4);
+  assert.equal(t.set.kind, 'talk');
   assert.equal(t.part, 4);
 });
 

@@ -13,7 +13,7 @@ export interface VadOptions {
   preRollMs: number;
 }
 
-export const DEFAULT_VAD: VadOptions = { gapMs: 2200, minSpeechMs: 600, maxUtteranceMs: 100_000, preRollMs: 300 };
+export const DEFAULT_VAD: VadOptions = { gapMs: 1350, minSpeechMs: 600, maxUtteranceMs: 100_000, preRollMs: 300 };
 
 /**
  * Energy based voice activity detector with an adaptive noise floor. Feed it raw mic frames; when a

@@ -73,16 +73,34 @@ export default function ControlPanel({ running, position, startPart, onStartPart
         </form>
       )}
 
-      <div className="space-y-1.5">
-        <div className="flex items-baseline justify-between">
-          <label htmlFor="gap" className="text-sm text-slate-600">
-            Im lặng bao lâu thì chốt một câu
-          </label>
-          <span className="text-sm font-medium text-slate-900">{(gapMs / 1000).toFixed(1)}s</span>
+      <details className="group border-t border-slate-100 pt-3">
+        <summary className="flex cursor-pointer list-none items-center justify-between text-xs font-medium text-slate-500 hover:text-slate-700">
+          <span>Cài đặt nâng cao (đang tự động chốt câu theo từng Part)</span>
+          <span className="transition-transform group-open:rotate-180" aria-hidden="true">▾</span>
+        </summary>
+        <div className="mt-3 space-y-1.5">
+          <div className="flex items-baseline justify-between">
+            <label htmlFor="gap" className="text-sm text-slate-600">
+              Im lặng bao lâu thì gửi đoạn âm thanh
+            </label>
+            <span className="text-sm font-medium text-slate-900">{(gapMs / 1000).toFixed(2)}s</span>
+          </div>
+          <input
+            id="gap"
+            type="range"
+            min={1000}
+            max={3500}
+            step={50}
+            value={gapMs}
+            onChange={(e) => onGap(Number(e.target.value))}
+            aria-describedby="gap-help"
+            className="w-full accent-slate-900"
+          />
+          <p id="gap-help" className="text-xs text-slate-400">
+            Mặc định tự động: Part 1–2 chốt ngay khi đủ câu (A–D / A–C); Part 3–4 gom đủ đoạn + 3 câu hỏi rồi trả lời 1 lần.
+          </p>
         </div>
-        <input id="gap" type="range" min={1200} max={4000} step={100} value={gapMs} onChange={(e) => onGap(Number(e.target.value))} className="w-full accent-slate-900" />
-        <p className="text-xs text-slate-400">Ngắn hơn: đáp án đến sớm hơn nhưng dễ cắt đôi một câu. Dài hơn thì ngược lại.</p>
-      </div>
+      </details>
     </section>
   );
 }

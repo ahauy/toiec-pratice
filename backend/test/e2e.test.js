@@ -29,8 +29,21 @@ function startMock() {
         return json({ choices: [{ message: { content: JSON.stringify(answerFor(JSON.parse(raw.toString()).messages)) } }] });
       }
       if (req.url.includes(':generateContent')) {
-        geminiCalls++;
         const b = JSON.parse(raw.toString());
+        const inline = b.contents?.[0]?.parts?.[0]?.inlineData;
+        if (inline) {
+          // Gemini STT request: base64 audio carries 'RIFF' + transcript
+          const s = Buffer.from(inline.data, 'base64').toString('latin1');
+          const m = s.match(/RIFF([^\r]*)/);
+          const delayMatch = /\[delay=(\d+)\]/.exec(m?.[1] ?? '');
+          const text = (m?.[1] ?? '').replace(/\[delay=\d+\]/, '');
+          const reply = () => json({ candidates: [{ content: { parts: [{ text }] } }] });
+          return delayMatch ? setTimeout(reply, Number(delayMatch[1])) : reply();
+        }
+        geminiCalls++;
+        if (failGroqChat) {
+          // when testing fallback, allow Gemini LLM to succeed
+        }
         const messages = [{ content: b.systemInstruction.parts[0].text }, { content: b.contents[0].parts[0].text }];
         return json({ candidates: [{ content: { parts: [{ text: JSON.stringify(answerFor(messages)) }] } }] });
       }
@@ -44,12 +57,16 @@ function answerFor(messages) {
   const sys = messages[0].content, user = messages[1].content;
   if (sys.includes('Part 1')) return { statements: [{ label: 'A', en: 'x', vi: 'x', focus: 'y' }, { label: 'B', en: 'x', vi: 'x' }] };
   if (sys.includes('Part 2')) return { question_en: 'q', question_vi: 'q', options: [], answer: 'b', reason_vi: 'r', confidence: 'high' };
-  const answered = Number(/Already answered questions: (\d+)/.exec(user)[1]);
-  const lastChunk = user.split('\n---\n').pop();
-  const asked = /\?/.test(lastChunk) && !/conversation body/.test(lastChunk);
+  const chunks = user.split('Transcript:\n')[1]?.split('\n---\n') ?? [];
+  const qChunks = chunks.slice(1).filter((c) => /\?/.test(c));
   return {
-    gist_vi: /Include gist_vi: yes/.test(user) ? 'Tóm tắt' : '',
-    questions: asked ? [{ text_en: 'Q?', answer_en: `ans-${answered}`, answer_vi: 'đáp án', confidence: 'high' }] : [],
+    gist_vi: /Include gist_vi: yes/.test(user) ? 'Tóm tắt đoạn hội thoại' : '',
+    questions: qChunks.map((q, idx) => ({
+      text_en: q,
+      answer_en: `ans-${idx + 1}`,
+      answer_vi: `đáp án ${idx + 1}`,
+      confidence: 'high',
+    })),
   };
 }
 
@@ -72,6 +89,9 @@ test.before(async () => {
   const port = mock.address().port;
   process.env.GROQ_API_KEY = 'test-groq';
   process.env.GEMINI_API_KEY = 'test-gemini';
+  process.env.LLM_CHAIN = 'groq:openai/gpt-oss-120b,gemini:gemini-3.5-flash-lite';
+  process.env.ITEM_FALLBACK_MS = '80';
+  process.env.SET_FALLBACK_MS = '120';
   process.env.GROQ_BASE_URL = `http://127.0.0.1:${port}`;
   process.env.GEMINI_BASE_URL = `http://127.0.0.1:${port}`;
   const { NestFactory } = require('@nestjs/core');
@@ -88,7 +108,7 @@ test('health endpoint reports configured providers', async () => {
   assert.deepEqual(r, { ok: true, groq: true, gemini: true });
 });
 
-test('part 2 item streams transcript -> position -> item -> done', async () => {
+test('part 2 item streams transcript -> position -> item -> done immediately when complete', async () => {
   const sid = 'sess-part2-aaaa';
   await post('/api/toeic/session', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid, part: 2 }) });
   const ev = await chunk(sid, 1, 'Number 7. Where is the meeting? A. Room 3. B. At noon. C. Yes.');
@@ -100,32 +120,50 @@ test('part 2 item streams transcript -> position -> item -> done', async () => {
   assert.equal(ev.find((e) => e.type === 'position').next, 8);
 });
 
+test('part 1/2 incomplete chunk flushes automatically via fallback timer when STT misses final label', async () => {
+  const sid = 'sess-fallback-timer';
+  await post('/api/toeic/session', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid, part: 2 }) });
+  // Only A and B present -> waits ITEM_FALLBACK_MS (80ms) then auto-flushes and returns item
+  const ev = await chunk(sid, 1, 'Number 7. Where is the meeting? A. Room 3. B. At noon.');
+  const item = ev.find((e) => e.type === 'item');
+  assert.ok(item, 'should auto-flush and emit item after fallback timeout');
+  assert.equal(item.number, 7);
+  assert.equal(ev.filter((e) => e.type === 'position').pop().next, 8);
+});
+
 test('chunks arriving out of order are still tracked in seq order', async () => {
   const sid = 'sess-order-bbbb';
   await post('/api/toeic/session', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid, part: 2 }) });
   // seq 2 is sent first (no cue) and must wait for seq 1
   const p2 = chunk(sid, 2, 'Who is leading the session? A. Ms. Kim. B. Monday. C. The lobby.');
-  await new Promise((r) => setTimeout(r, 150));
+  await new Promise((r) => setTimeout(r, 50));
   const p1 = chunk(sid, 1, 'Number 7. Where is the meeting? A. Room 3. B. At noon. C. Yes.');
   const [e2, e1] = [await p2, await p1];
   assert.equal(e1.find((e) => e.type === 'item').number, 7);
   assert.equal(e2.find((e) => e.type === 'item').number, 8);
 });
 
-test('part 3 set: gist after the body, then one answer per spoken question', async () => {
+test('part 3 set: buffers passage and 3 questions, then calls LLM once for gist + all 3 answers', async () => {
   const sid = 'sess-set3-cccc';
   await post('/api/toeic/session', { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sessionId: sid, part: 3 }) });
   const body = await chunk(sid, 1, 'Questions 32 through 34 refer to the following conversation. Hi this is Anna, your order is ready.');
-  const s1 = body.find((e) => e.type === 'set');
-  assert.equal(s1.gist_vi, 'Tóm tắt');
-  assert.equal(s1.questions.length, 0);
-  const q1 = await chunk(sid, 2, 'Why is the woman calling?');
-  const s2 = q1.find((e) => e.type === 'set');
-  assert.equal(s2.gist_vi, undefined);
-  assert.equal(s2.questions[0].number, 32);
-  const q2 = await chunk(sid, 3, 'What does the man ask about?');
-  assert.equal(q2.find((e) => e.type === 'set').questions[0].number, 33);
-  const q3 = await chunk(sid, 4, 'What will the woman do next?');
+  assert.equal(body.find((e) => e.type === 'set'), undefined);
+
+  // Send Q1, Q2, Q3 rapidly so Q3 completes the set immediately
+  const pQ1 = chunk(sid, 2, 'Why is the woman calling?');
+  await new Promise((r) => setTimeout(r, 20));
+  const pQ2 = chunk(sid, 3, 'What does the man ask about?');
+  await new Promise((r) => setTimeout(r, 20));
+  const pQ3 = chunk(sid, 4, 'What will the woman do next?');
+
+  const [q1, q2, q3] = await Promise.all([pQ1, pQ2, pQ3]);
+  assert.equal(q1.find((e) => e.type === 'set'), undefined);
+  assert.equal(q2.find((e) => e.type === 'set'), undefined);
+
+  const setEv = q3.find((e) => e.type === 'set');
+  assert.ok(setEv, 'third question should emit the complete set');
+  assert.equal(setEv.gist_vi, 'Tóm tắt đoạn hội thoại');
+  assert.deepEqual(setEv.questions.map((q) => q.number), [32, 33, 34]);
   const last = q3.filter((e) => e.type === 'position').pop();
   assert.deepEqual([last.part, last.next], [3, 35]);
 });

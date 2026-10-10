@@ -87,8 +87,8 @@ export function useListener() {
   const positionRef = useRef(position);
   positionRef.current = position;
 
-  // Tự động điều chỉnh gapMs theo Part: Part 1/2 dùng 1600ms, Part 3/4 dùng 2200ms
-  const autoGapForPart = useCallback((part: Part): number => (part <= 2 ? 1600 : 2200), []);
+  // Tự động điều chỉnh gapMs theo Part: Part 1/2 dùng 1350ms, Part 3/4 dùng 1500ms
+  const autoGapForPart = useCallback((part: Part): number => (part <= 2 ? 1350 : 1500), []);
 
   // Sync gapMs khi part thay đổi (chỉ khi user chưa tự chỉnh tay)
   const userAdjustedGap = useRef(false);
