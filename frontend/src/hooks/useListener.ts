@@ -87,10 +87,14 @@ export function useListener() {
   const positionRef = useRef(position);
   positionRef.current = position;
 
-  // Tự động điều chỉnh gapMs theo Part: Part 1/2 dùng 1350ms, Part 3/4 dùng 1500ms
-  const autoGapForPart = useCallback((part: Part): number => (part <= 2 ? 1350 : 1500), []);
+  // Tự động điều chỉnh chu kỳ cửa sổ (windowMs) và khoảng lặng (gapMs) theo Part
+  const autoTimingForPart = useCallback((part: Part): { windowMs: number; gapMs: number } => {
+    if (part === 1) return { windowMs: 19_000, gapMs: 2500 };
+    if (part === 2) return { windowMs: 11_000, gapMs: 2000 };
+    return { windowMs: 24_000, gapMs: 2000 };
+  }, []);
 
-  // Sync gapMs khi part thay đổi (chỉ khi user chưa tự chỉnh tay)
+  // Sync khi part thay đổi (chỉ khi user chưa tự chỉnh tay)
   const userAdjustedGap = useRef(false);
 
   const pushIssue = useCallback((seq: number, stage: Issue["stage"], message: string) => {
@@ -101,18 +105,18 @@ export function useListener() {
     if (e.type === "transcript") setLines((v) => [{ seq: e.seq, text: e.text, sttMs: e.sttMs, provider: e.provider }, ...v].slice(0, 40));
     else if (e.type === "position") {
       setPos((prev) => {
-        // Auto-adjust gapMs nếu Part thay đổi và user chưa tự chỉnh tay
+        // Auto-adjust timing nếu Part thay đổi và user chưa tự chỉnh tay
         if (e.part !== prev.part && !userAdjustedGap.current) {
-          const newGap = autoGapForPart(e.part);
-          setGapMsState(newGap);
-          live.current?.det.setGap(newGap);
+          const t = autoTimingForPart(e.part);
+          setGapMsState(t.gapMs);
+          live.current?.det.setWindow(t.windowMs, t.gapMs);
         }
         return { part: e.part, next: e.next };
       });
     }
     else if (e.type === "error") pushIssue(e.seq, e.stage, e.message);
     else setFeed((f) => applyEvent(f, e));
-  }, [pushIssue, autoGapForPart]);
+  }, [pushIssue, autoTimingForPart]);
 
   const upload = useCallback(
     async (samples: Float32Array, l: Live) => {
@@ -157,8 +161,8 @@ export function useListener() {
 
       // Reset auto-gap tracking và đặt giá trị đúng cho part bắt đầu
       userAdjustedGap.current = false;
-      const initialGap = autoGapForPart(startPart);
-      setGapMsState(initialGap);
+      const initialTiming = autoTimingForPart(startPart);
+      setGapMsState(initialTiming.gapMs);
 
       const sessionId = crypto.randomUUID();
       sessionRef.current = sessionId;
@@ -187,7 +191,10 @@ export function useListener() {
       node.connect(mute);
       mute.connect(ctx.destination);
 
-      const det = new UtteranceDetector(ctx.sampleRate, { gapMs: initialGap });
+      const det = new UtteranceDetector(ctx.sampleRate, {
+        windowMs: initialTiming.windowMs,
+        gapMs: initialTiming.gapMs,
+      });
       const l: Live = { stream, ctx, node, det, sessionId, seq: 0, timer: 0 };
       node.port.onmessage = (m: MessageEvent<Float32Array>) => {
         const utterance = det.push(m.data);
@@ -209,7 +216,7 @@ export function useListener() {
       setIssues([]);
       setRunning(true);
     },
-    [autoGapForPart, upload],
+    [autoTimingForPart, upload],
   );
 
   const stop = useCallback(() => {

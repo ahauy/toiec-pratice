@@ -24,25 +24,28 @@ export interface Transcript {
  */
 const GEMINI_PROMPT_P12 =
   `Transcribe this audio word for word in English. It comes from a TOEIC Listening test, Part 1 or 2.\n` +
-  `Keep spoken cues such as "Number 7" or "Mark your answer on your answer sheet".\n` +
+  `Keep spoken question numbers as digits (e.g. "Number 1", "Number 2") and keep spoken option letters ("A.", "B.", "C.", "D.").\n` +
   `Output ONLY the raw transcript. If there is no clear speech, output nothing.`;
 
 const GEMINI_PROMPT_P34 =
   `Transcribe this audio word for word in English. It comes from a TOEIC Listening test, Part 3 or 4.\n` +
-  `Keep spoken cues such as "Questions 32 through 34 refer to the following conversation with two speakers".\n` +
+  `Keep spoken cues such as "Questions 32 through 34 refer to the following conversation" and "Number 32".\n` +
   `Output ONLY the raw transcript. If there is no clear speech, output nothing.`;
 
-/** Phát hiện n-gram lặp – dấu hiệu hallucination của model (vd: "Thank you. Thank you. Thank you.") */
-function hasRepetition(text: string): boolean {
+/**
+ * Phát hiện lặp từ liên tiếp (consecutive loop) – dấu hiệu hallucination của STT
+ * (vd: "Thank you. Thank you. Thank you."). Không lọc các câu Part 1 bắt đầu giống nhau
+ * ở các đáp án A/B/C/D (vd: "A. He is... B. He is... C. He is... D. He is...").
+ */
+export function hasRepetition(text: string): boolean {
   const words = text.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(Boolean);
   for (let n = 2; n <= 5; n++) {
-    for (let i = 0; i + n * 2 <= words.length; i++) {
+    for (let i = 0; i + n * 3 <= words.length; i++) {
       const gram = words.slice(i, i + n).join(' ');
-      let count = 0;
-      for (let j = 0; j + n <= words.length; j++) {
-        if (words.slice(j, j + n).join(' ') === gram) count++;
-      }
-      if (count >= 3) return true;
+      const next1 = words.slice(i + n, i + n * 2).join(' ');
+      const next2 = words.slice(i + n * 2, i + n * 3).join(' ');
+      // 3 lần lặp liên tiếp sát nhau (back-to-back)
+      if (gram === next1 && gram === next2) return true;
     }
   }
   return false;
@@ -50,7 +53,7 @@ function hasRepetition(text: string): boolean {
 
 /** Phát hiện transcript chỉ toàn boilerplate TOEIC, không có nội dung thật */
 const BOILERPLATE_ONLY =
-  /^[\s.]*(?:mark your answer on your answer sheet\.?\s*)+[\s.]*$/i;
+  /^[\s.]*(?:(?:mark your answer on your answer sheet|go on to the next page|now,?\s+part\s+(?:1|2|3|4|one|two|three|four)\s+will\s+begin)\.?\s*)+[\s.]*$/i;
 
 @Injectable()
 export class SttService {
@@ -79,8 +82,8 @@ export class SttService {
         } catch (e) {
           const err = e as ProviderError;
           errors.push(`${spec.model}: ${err.message}`);
-          if (err.transient && attempt === 0) {
-            await new Promise((r) => setTimeout(r, 300));
+          if ((err.transient || (err.status === 429 && chain.length === 1)) && attempt === 0) {
+            await new Promise((r) => setTimeout(r, err.status === 429 ? 800 : 300));
             continue;
           }
           if (err instanceof ProviderError) this.cool.chill(spec, err.cooldownMs);
@@ -109,10 +112,10 @@ export class SttService {
               ],
             },
           ],
-          generationConfig: { temperature: 0, maxOutputTokens: 1024 },
+          generationConfig: { temperature: 0, maxOutputTokens: 512 },
         }),
       },
-      25_000,
+      20_000,
     );
     if (!res.ok) throw await toProviderError(res, `gemini ${spec.model}`);
     const data = (await res.json()) as {

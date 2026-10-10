@@ -18,9 +18,9 @@ test('part 1: cue then cue-less chunks advance the counter', () => {
   assert.equal(b[0].number, 2);
 });
 
-test('part 1: multi-chunk item buffers until option D arrives', () => {
+test('part 1: multi-chunk item buffers until option D arrives and does not prematurely complete on boilerplate', () => {
   const t = new Tracker();
-  const r1 = t.ingest('Number 1. Look at the picture marked number 1 in your test book. A. The man is pulling a cart. B. The woman is reading.');
+  const r1 = t.ingest('Now, part one will begin. Number one. Look at the picture marked number one in your test book. A. The man is pulling a cart. B. The woman is reading.');
   assert.equal(r1.jobs.length, 0);
   assert.deepEqual(t.position(), { part: 1, next: 1 });
 
@@ -29,6 +29,37 @@ test('part 1: multi-chunk item buffers until option D arrives', () => {
   assert.equal(r2.jobs[0].number, 1);
   assert.match(r2.jobs[0].text, /A\. The man.*D\. A bike/s);
   assert.deepEqual(t.position(), { part: 1, next: 2 });
+});
+
+test('part 1: full 6-question BTVN audio sequence processes all 6 items without skipping or filtering parallel sentences', () => {
+  const { hasRepetition } = require('../dist/toeic/services/stt.service');
+  const t = new Tracker();
+  const chunks = [
+    'Directions: For each question in this part, you will hear four statements about a picture in your test book. When you hear the statements, you must select the one statement that best describes what you see in the picture. Then find the number of the question on your answer sheet and mark your answer. The statements will not be printed in your test book and will be spoken only one time.',
+    "Now, part one will begin. Number one. Look at the picture marked number one in your test book. A. He's picking up a bag. B. He's cycling on a road. C. He's climbing some rocks. D. He's wearing a jacket.",
+    "Number two. Look at the picture marked number two in your test book. A. They're seated in a waiting area. B. They're placing books on a table. C. One of the women is moving a chair. D. One of the women is watering a plant.",
+    'Go on to the next page.',
+    'Number three. Look at the picture marked number three in your test book. A. A man is pushing a shopping cart. B. A man is paying for some groceries. C. Some merchandise is arranged on shelves. D. Some baskets are lined up on the floor.',
+    "Number 4. Look at the picture marked number 4 in your test book. A. A woman's working at a laptop computer. B. A woman's drinking from a bottle. C. A woman's stacking some furniture. D. A woman's putting items in a backpack.",
+    'Number 5. Look at the picture marked number 5 in your test book. A. A stage has been set up indoors. B. Some people are watching a performance. C. People are waiting in line for tickets. D. A concert hall is unoccupied.',
+    'Number 6. Look at the picture marked number 6 in your test book. A. Some pedestrians are crossing at an intersection. B. Tree branches are being cleared off a walkway. C. Some vehicles are facing a low wall. D. A car is exiting a parking garage.',
+    'Go on to the next page.',
+  ];
+
+  // Ensure none of the 6 Part 1 items are flagged as STT hallucinations
+  for (const c of chunks) {
+    assert.equal(hasRepetition(c), false, `should not flag valid Part 1 transcript as repetition: ${c}`);
+  }
+  assert.equal(hasRepetition('Thank you. Thank you. Thank you. Thank you.'), true);
+
+  const emitted = [];
+  for (const c of chunks) {
+    emitted.push(...t.ingest(c).jobs);
+  }
+  assert.deepEqual(emitted.map((j) => j.number), [1, 2, 3, 4, 5, 6]);
+  for (const j of emitted) {
+    assert.match(j.text, /\bA\..*\bB\..*\bC\..*\bD\./s);
+  }
 });
 
 test('part 2: two items merged in one chunk are split by "Number N" cues', () => {

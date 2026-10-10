@@ -3,8 +3,12 @@ import { resample } from "./wav";
 export const TARGET_RATE = 16000;
 
 export interface VadOptions {
-  /** silence (ms) that ends an utterance */
+  /** silence (ms) that ends an utterance when shorter than windowMs */
   gapMs: number;
+  /** target rolling window (ms): once utterance reaches this length, cut on the first brief pause (snapGapMs) */
+  windowMs: number;
+  /** brief pause (ms) used to cut cleanly between words once windowMs is reached */
+  snapGapMs: number;
   /** utterances with less voiced audio than this are dropped as noise */
   minSpeechMs: number;
   /** hard cap: force-cut very long utterances */
@@ -13,12 +17,22 @@ export interface VadOptions {
   preRollMs: number;
 }
 
-export const DEFAULT_VAD: VadOptions = { gapMs: 1350, minSpeechMs: 600, maxUtteranceMs: 100_000, preRollMs: 300 };
+export const DEFAULT_VAD: VadOptions = {
+  gapMs: 2500,
+  windowMs: 19_000,
+  snapGapMs: 1250,
+  minSpeechMs: 500,
+  maxUtteranceMs: 45_000,
+  preRollMs: 300,
+};
 
 /**
- * Energy based voice activity detector with an adaptive noise floor. Feed it raw mic frames; when a
- * stretch of speech is followed by `gapMs` of silence it returns the utterance resampled to 16 kHz.
- * Tuned for "exam audio played from another device, picked up by the microphone".
+ * Energy based voice activity detector with an adaptive noise floor + Rolling Window cutter.
+ * - Continuously captures audio frames.
+ * - Once an utterance reaches `windowMs` (e.g. ~18s in Part 1, ~12s in Part 2, ~22s in Part 3/4),
+ *   it cuts on the very first brief pause (`snapGapMs` ~0.55s) so answers are returned promptly
+ *   in batches without cutting mid-word, while immediately continuing to record the next window.
+ * - If a natural long silence (`gapMs` ~2.2s) happens earlier, it also cuts cleanly.
  */
 export class UtteranceDetector {
   level = 0;
@@ -26,7 +40,7 @@ export class UtteranceDetector {
 
   private opts: VadOptions;
   private floor = 0.004;
-  private calibrateMs = 500;
+  private calibrateMs = 400;
   private aboveCount = 0;
   private frames: Float32Array[] = [];
   private preRoll: Float32Array[] = [];
@@ -46,6 +60,11 @@ export class UtteranceDetector {
     this.opts.gapMs = ms;
   }
 
+  setWindow(windowMs: number, gapMs?: number) {
+    this.opts.windowMs = windowMs;
+    if (gapMs !== undefined) this.opts.gapMs = gapMs;
+  }
+
   push(frame: Float32Array): Float32Array | null {
     const ms = (frame.length / this.sampleRate) * 1000;
     let sum = 0;
@@ -59,8 +78,8 @@ export class UtteranceDetector {
       return null;
     }
 
-    const on = Math.max(0.008, this.floor * 3);
-    const off = Math.max(0.005, this.floor * 1.8);
+    const on = Math.max(0.007, this.floor * 2.8);
+    const off = Math.max(0.004, this.floor * 1.5);
 
     if (!this.speaking) {
       // learn the ambient level only while idle
@@ -87,7 +106,13 @@ export class UtteranceDetector {
     } else {
       this.silenceMs += ms;
     }
-    if (this.silenceMs >= this.opts.gapMs || this.totalMs >= this.opts.maxUtteranceMs) return this.finish();
+
+    // Once we have recorded at least `windowMs` (X seconds), cut at the first short breath pause (`snapGapMs`).
+    // Before `windowMs`, only cut on a full inter-question pause (`gapMs`).
+    const effectiveGap = this.totalMs >= this.opts.windowMs ? this.opts.snapGapMs : this.opts.gapMs;
+    if (this.silenceMs >= effectiveGap || this.totalMs >= this.opts.maxUtteranceMs) {
+      return this.finish();
+    }
     return null;
   }
 

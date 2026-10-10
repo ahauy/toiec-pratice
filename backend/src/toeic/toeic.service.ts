@@ -156,21 +156,36 @@ export class ToeicService {
     try {
       if (job.kind === 'item') {
         if (job.part === 1) {
-          const r = await this.llm.json<Part1Result>(PART1_SYSTEM, part1User(job.text), { maxTokens: 700 });
-          const statements = Array.isArray(r.data.statements) ? r.data.statements : [];
-          // validate: cần ít nhất 1 statement có label
-          if (!statements.some((s) => s.label)) return;
+          const r = await this.llm.json<Part1Result>(PART1_SYSTEM, part1User(job.text), { maxTokens: 450 });
+          const rawStatements = Array.isArray(r.data.statements) ? r.data.statements : [];
+          const labels = ['A', 'B', 'C', 'D'];
+          const statements = rawStatements
+            .filter((st) => st && (st.en || st.vi || st.label))
+            .slice(0, 4)
+            .map((st, idx) => ({
+              label: (st.label ? String(st.label).trim().charAt(0).toUpperCase() : labels[idx]) || labels[idx],
+              en: st.en ?? '',
+              vi: st.vi ?? '',
+              focus: st.focus,
+            }));
+          if (!statements.length) return;
           emit({ type: 'item', seq, part: 1, number: job.number, data: { statements }, ms: r.ms, model: r.model });
         } else {
-          const r = await this.llm.json<Part2Result>(PART2_SYSTEM, part2User(job.text), { maxTokens: 600 });
+          const r = await this.llm.json<Part2Result>(PART2_SYSTEM, part2User(job.text), { maxTokens: 400 });
           const letter = String(r.data.answer ?? '').trim().charAt(0).toUpperCase();
           const answer = (['A', 'B', 'C'].includes(letter) ? letter : 'A') as 'A' | 'B' | 'C';
-          // validate: cần có question_en và options
-          if (!r.data.question_en && !Array.isArray(r.data.options)) return;
+          const optLabels = ['A', 'B', 'C'];
+          const options = Array.isArray(r.data.options)
+            ? r.data.options.slice(0, 3).map((opt, idx) => ({
+                label: (opt?.label ? String(opt.label).trim().charAt(0).toUpperCase() : optLabels[idx]) || optLabels[idx],
+                en: opt?.en ?? '',
+                vi: opt?.vi ?? '',
+              }))
+            : [];
           const data: Part2Result = {
-            question_en: r.data.question_en ?? '',
+            question_en: r.data.question_en ?? job.text,
             question_vi: r.data.question_vi ?? '',
-            options: Array.isArray(r.data.options) ? r.data.options : [],
+            options,
             answer,
             reason_vi: r.data.reason_vi ?? '',
             confidence: ['A', 'B', 'C'].includes(letter) ? asConfidence(r.data.confidence) : 'low',
@@ -196,8 +211,8 @@ export class ToeicService {
     const answeredBefore = set.answered;
     const remainingQ = size - answeredBefore;
 
-    // Adaptive maxTokens: đủ cho cả tóm tắt đoạn + 3 câu hỏi
-    const maxTokens = needGist && remainingQ === 0 ? 400 : 400 + remainingQ * 220;
+    // Compact maxTokens for fast generation of gist + 3 concise answers
+    const maxTokens = needGist && remainingQ === 0 ? 250 : 250 + remainingQ * 150;
 
     const r = await this.llm.json<{ gist_vi?: string; questions?: Partial<SetQuestion>[] }>(
       SET_SYSTEM,
@@ -209,7 +224,7 @@ export class ToeicService {
         needGist,
         chunks: [...set.chunks],
       }),
-      { maxTokens, timeoutMs: 18_000 },
+      { maxTokens, timeoutMs: 15_000 },
     );
 
     const gist = needGist && typeof r.data.gist_vi === 'string' && r.data.gist_vi.trim() ? r.data.gist_vi.trim() : undefined;
@@ -217,13 +232,13 @@ export class ToeicService {
 
     const raw = Array.isArray(r.data.questions) ? r.data.questions.slice(0, remainingQ) : [];
     const questions: SetQuestion[] = raw
-      .filter((q) => q.answer_en) // validate: bỏ question trống
+      .filter((q) => q && (q.answer_en || q.answer_vi || q.text_en))
       .map((q, i) => ({
         number: set.first + answeredBefore + i,
         text_en: q.text_en ?? '',
         text_vi: q.text_vi,
-        answer_en: q.answer_en ?? '',
-        answer_vi: q.answer_vi ?? '',
+        answer_en: q.answer_en || q.answer_vi || '',
+        answer_vi: q.answer_vi || q.answer_en || '',
         reason_vi: q.reason_vi,
         confidence: asConfidence(q.confidence),
         needs_visual: !!q.needs_visual,

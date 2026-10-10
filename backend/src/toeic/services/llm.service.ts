@@ -54,14 +54,14 @@ export class LlmService {
       for (let attempt = 0; attempt < 2; attempt++) {
         const t0 = Date.now();
         try {
-          const raw = await this.call(spec, system, user, opts.maxTokens ?? 1500, opts.timeoutMs ?? 12_000);
+          const raw = await this.call(spec, system, user, opts.maxTokens ?? 700, opts.timeoutMs ?? 12_000);
           return { data: parseJsonLoose(raw) as T, model: `${spec.provider}:${spec.model}`, ms: Date.now() - t0 };
         } catch (e) {
           if (e instanceof ProviderError) {
             errors.push(`${spec.model}: ${e.message}`);
-            if (e.transient && attempt === 0) {
-              await new Promise((r) => setTimeout(r, 300));
-              continue; // one quick retry on 5xx / timeout
+            if ((e.transient || (e.status === 429 && chain.length === 1)) && attempt === 0) {
+              await new Promise((r) => setTimeout(r, e.status === 429 ? 800 : 300));
+              continue; // quick retry on 5xx / timeout or single-provider 429
             }
             this.cool.chill(spec, e.cooldownMs);
           } else {
@@ -84,7 +84,7 @@ export class LlmService {
           { role: 'system', content: system },
           { role: 'user', content: user },
         ],
-        temperature: 0.2,
+        temperature: 0.1,
         max_completion_tokens: maxTokens,
         response_format: { type: 'json_object' },
       };
@@ -113,7 +113,7 @@ export class LlmService {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: system }] },
           contents: [{ role: 'user', parts: [{ text: user }] }],
-          generationConfig: { temperature: 0.2, maxOutputTokens: maxTokens, responseMimeType: 'application/json' },
+          generationConfig: { temperature: 0.1, maxOutputTokens: maxTokens, responseMimeType: 'application/json' },
         }),
       },
       timeoutMs,
